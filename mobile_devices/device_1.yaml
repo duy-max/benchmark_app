@@ -1,0 +1,7 @@
+platformName: android
+platformVersion: '11.0'
+deviceName: '7c000c654500c92235d'
+udid: '7c000c654500c92235d'
+noReset: false
+fullReset: false
+newCommandTimeout: 300
