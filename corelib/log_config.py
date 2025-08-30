@@ -1,12 +1,11 @@
 import logging
-import os
-import pathlib
+from pathlib import Path
 
 def _ensure_logs_dir(dir_name: str="logs"):
-    project_root = pathlib.Path(__file__).resolve().parents[1]
+    project_root = Path(__file__).resolve().parents[1]
     logs_dir = project_root / f"{dir_name}"
     logs_dir.mkdir(parents=True, exist_ok=True)
-    return str(logs_dir)
+    return logs_dir
 
 def get_logger(name="benchmark_app", level=logging.INFO, filename="benchmark.log", dir_name="logs"):
     """
@@ -17,8 +16,7 @@ def get_logger(name="benchmark_app", level=logging.INFO, filename="benchmark.log
     - sets logger._log_path to file path
     """
     logs_dir = _ensure_logs_dir(dir_name)
-    log_path = os.path.join(logs_dir, filename)
-
+    log_path = logs_dir / filename
     logger = logging.getLogger(name)
     # simple: remove existing handlers to avoid duplicates
     if logger.handlers:

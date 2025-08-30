@@ -1,5 +1,4 @@
 import argparse
-import os
 import re
 import subprocess
 import time
@@ -10,7 +9,7 @@ from corelib.app_handler import AppHandler
 from corelib.log_config import get_logger
 from corelib.record_video import start_recording, stop_recording
 from corelib.utils import assert_value_status
-from lib.mapp.dashboard import Dashboard
+from lib.dashboard import Dashboard
 
 
 def setup_run_logger():
@@ -20,7 +19,7 @@ def setup_run_logger():
     # create logs_run dir
     project_root = Path(__file__).resolve().parent
     logs_run_dir = project_root / 'logs_run'
-    os.makedirs(logs_run_dir, exist_ok=True)
+    logs_run_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     log_filename = f"run_session_{timestamp}.log"
@@ -108,7 +107,7 @@ def _check_session(dashboard):
 
 def _check_process(dashboard):
     try:
-        device_id = dashboard.app.desired_caps.get('udid')
+        device_id = _get_device_id(dashboard)
         cmd = ["adb"]
         if device_id:
             cmd += ["-s", str(device_id)]
@@ -120,23 +119,6 @@ def _check_process(dashboard):
     except Exception:
         pass
     return True, None
-
-def _check_activity(dashboard):
-    try:
-        current_activity = dashboard.app.driver.current_activity
-        if not current_activity:
-            return False, "No current activity - app may be backgrounded/killed"
-
-        app_package = "com.innova.benchmark"
-        if (app_package in current_activity or
-                current_activity.startswith('.') or
-                'benchmark' in current_activity.lower()):
-            return True, f"App running - current activity: {current_activity}"
-        else:
-            return False, f"App not in foreground - current activity: {current_activity}"
-    except Exception as ex:
-        return False, f"Failed to get current activity: {ex}"
-
 
 def check_app_health(dashboard):
     """Run multiple health checks on the app"""
@@ -231,7 +213,7 @@ def restart_app_after_crash(dashboard, run_logger, crash_type, run_idx):
             log_and_print(run_logger, "UiAutomator crashed - performing thorough restart")
             # Force kill instrumentation
             try:
-                device_id = dashboard.app.desired_caps.get('udid')
+                device_id = _get_device_id(dashboard)
                 cmd_kill_inst = ["adb"]
                 if device_id:
                     cmd_kill_inst += ["-s", str(device_id)]
@@ -250,7 +232,7 @@ def restart_app_after_crash(dashboard, run_logger, crash_type, run_idx):
 
         # Verify restart by launching explicitly
         try:
-            device_id = dashboard.app.desired_caps.get('udid')
+            device_id = _get_device_id(dashboard)
             cmd_launch = ["adb"]
             if device_id:
                 cmd_launch += ["-s", str(device_id)]
@@ -270,7 +252,7 @@ def restart_app_after_crash(dashboard, run_logger, crash_type, run_idx):
         return False, error_msg
 
 
-def handle_step_crash(dashboard, run_logger, step_name, exception, run_idx, video_started):
+def handle_step_crash(dashboard, run_logger, step_name, exception, run_idx, video_started, logs_dir):
     """
     Xử lý khi step bị crash - always break to next run after crash
     """
@@ -284,14 +266,11 @@ def handle_step_crash(dashboard, run_logger, step_name, exception, run_idx, vide
     if video_started:
         try:
             ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-            project_root = os.path.dirname(os.path.abspath(__file__))
-            logs_dir = os.path.join(project_root, "logs")
-            os.makedirs(logs_dir, exist_ok=True)
             video_name = f"VIDEO_{crash_type.upper()}_{step_name}_run{run_idx}_{ts}.mp4"
-            video_path = os.path.join(logs_dir, video_name)
-            stop_recording(video_path)
+            video_path = logs_dir / video_name
+            stop_recording(str(video_path))
             video_stopped = True
-            log_and_print(run_logger, f"📹 Crash video saved: {video_path}")
+            log_and_print(run_logger, f"📹 Crash video saved: {str(video_path)}")
         except Exception as stop_ex:
             log_and_print(run_logger, f"Failed to stop/save crash video: {stop_ex}", "warning")
 
@@ -339,7 +318,7 @@ def compare_expected_vs_actual(expected_map, actual_status):
     return mismatches
 
 
-def handle_get_status(dashboard, run_logger, run_idx, video_started = False):
+def handle_get_status(dashboard, run_logger, run_idx, logs_dir, video_started = False):
     """
     Single-attempt get_status with proper "Not Test" handling
     """
@@ -368,7 +347,8 @@ def handle_get_status(dashboard, run_logger, run_idx, video_started = False):
                     step_name="get_status_wifi_disabled",
                     exception=Exception("Wi‑Fi disabled after get_status"),
                     run_idx=run_idx,
-                    video_started=video_started
+                    video_started=video_started,
+                    logs_dir= logs_dir
                 )
                 return {}, "wifi_disabled", "Wi-Fi is still disabled after trying to enable it"
 
@@ -381,7 +361,8 @@ def handle_get_status(dashboard, run_logger, run_idx, video_started = False):
                     step_name="get_status_bluetooth_disabled",
                     exception=Exception("Bluetooth disabled after get_status"),
                     run_idx=run_idx,
-                    video_started=video_started
+                    video_started=video_started,
+                    logs_dir= logs_dir
                 )
                 return {}, "bluetooth_disabled", "Bluetooth is still disabled after trying to enable it"
 
@@ -412,48 +393,47 @@ def handle_get_status(dashboard, run_logger, run_idx, video_started = False):
         return {}, "status_failed", err_desc
 
 
-def handle_get_status_failure(dashboard, run_logger, run_idx, error_type, error_message, video_started):
-    """
-    Xử lý khi get_status thất bại
-    Returns: (video_stopped, diagnostics_collected)
-    """
-    log_and_print(run_logger, f"Failed to get status: {error_message}", "error")
-
-    # Stop video for get_status failure
-    video_stopped = False
-    if video_started:
-        try:
-            status_fail_filename = f"STATUS_FAIL_{error_type.upper()}_run{run_idx}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
-            project_root = os.path.dirname(os.path.abspath(__file__))
-            logs_dir = os.path.join(project_root, "logs")
-            status_fail_fullpath = os.path.join(logs_dir, status_fail_filename)
-
-            stop_recording(status_fail_fullpath)
-            log_and_print(run_logger, f"📹 Stopped video for get_status failure: {status_fail_fullpath}")
-            video_stopped = True
-
-            if os.path.exists(status_fail_fullpath):
-                file_size = os.path.getsize(status_fail_fullpath)
-                log_and_print(run_logger, f"✅ Status fail video created: {status_fail_fullpath} ({file_size} bytes)")
-        except Exception as stop_ex:
-            log_and_print(run_logger, f"Failed to stop status fail video: {stop_ex}", "error")
-
-    # Collect diagnostics
-    diagnostics_collected = False
-    try:
-        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-        tag = f"run{run_idx}_get_status_{error_type}_{ts}"
-        collected = dashboard.app.collect_on_failure(
-            reason=f"get_status failed in run {run_idx}: {error_message}",
-            tag=tag
-        )
-        full_tag = get_full_collected_tag(collected, tag)
-        log_and_print(run_logger, f"Collected get_status failure logs: {full_tag}")
-        diagnostics_collected = True
-    except Exception as collect_ex:
-        log_and_print(run_logger, f"Failed to collect get_status logs: {collect_ex}", "error")
-
-    return video_stopped, diagnostics_collected
+# def handle_get_status_failure(dashboard, run_logger, run_idx, error_type, error_message, video_started):
+#     """
+#     Xử lý khi get_status thất bại
+#     Returns: (video_stopped, diagnostics_collected)
+#     """
+#     log_and_print(run_logger, f"Failed to get status: {error_message}", "error")
+#
+#     # Stop video for get_status failure
+#     video_stopped = False
+#     if video_started:
+#         try:
+#             status_fail_filename = f"STATUS_FAIL_{error_type.upper()}_run{run_idx}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
+#             project_root = Path(__file__).resolve().parent
+#             logs_dir = project_root / "logs"
+#             status_fail_fullpath = logs_dir / status_fail_filename
+#             stop_recording(str(status_fail_fullpath))
+#             log_and_print(run_logger, f"📹 Stopped video for get_status failure: {str(status_fail_fullpath)}")
+#             video_stopped = True
+#
+#             if status_fail_fullpath.exists():
+#                 file_size = status_fail_fullpath.stat().st_size
+#                 log_and_print(run_logger, f"✅ Status fail video created: {status_fail_fullpath} ({file_size} bytes)")
+#         except Exception as stop_ex:
+#             log_and_print(run_logger, f"Failed to stop status fail video: {stop_ex}", "error")
+#
+#     # Collect diagnostics
+#     diagnostics_collected = False
+#     try:
+#         ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+#         tag = f"run{run_idx}_get_status_{error_type}_{ts}"
+#         collected = dashboard.app.collect_on_failure(
+#             reason=f"get_status failed in run {run_idx}: {error_message}",
+#             tag=tag
+#         )
+#         full_tag = get_full_collected_tag(collected, tag)
+#         log_and_print(run_logger, f"Collected get_status failure logs: {full_tag}")
+#         diagnostics_collected = True
+#     except Exception as collect_ex:
+#         log_and_print(run_logger, f"Failed to collect get_status logs: {collect_ex}", "error")
+#
+#     return video_stopped, diagnostics_collected
 
 
 def calculate_run_result(step_crashed, crashed_step, crash_type, failed_steps, status_error_type):
@@ -477,7 +457,7 @@ def calculate_run_result(step_crashed, crashed_step, crash_type, failed_steps, s
     else:
         return 'passed', "All steps and assertions passed"
 
-def cleanup_video_at_run_end(video_started, video_stopped, run_logger, result_type, run_idx):
+def cleanup_video_at_run_end(video_started, video_stopped, run_logger, result_type, run_idx, logs_dir):
     """
     Cleanup video cuối mỗi run nếu chưa được stop
     """
@@ -493,9 +473,6 @@ def cleanup_video_at_run_end(video_started, video_stopped, run_logger, result_ty
             else:
                 # For other cases, still save to logs
                 cleanup_filename = f"UnknownCrash_{result_type.upper()}_run{run_idx}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
-                project_root = Path(__file__).resolve().parent
-                logs_dir = project_root / "logs"
-                logs_dir.mkdir(exist_ok=True)
                 cleanup_fullpath = logs_dir / cleanup_filename
                 stop_recording(str(cleanup_fullpath))
                 log_and_print(run_logger, f"Unknown crash video saved: {cleanup_fullpath}")
@@ -503,7 +480,7 @@ def cleanup_video_at_run_end(video_started, video_stopped, run_logger, result_ty
             log_and_print(run_logger, f"Failed to cleanup video: {cleanup_ex}", "error")
 
 
-def test_dashboard(dashboard, runs=10, expected_map=None):
+def test_suite(dashboard, runs=10, expected_map=None):
     run_logger = setup_run_logger()
     if expected_map is None:
         expected_map = {
@@ -522,7 +499,7 @@ def test_dashboard(dashboard, runs=10, expected_map=None):
 
     project_root = Path(__file__).resolve().parent
     logs_dir = project_root / "logs"
-    os.makedirs(logs_dir, exist_ok=True)
+    logs_dir.mkdir(parents=True, exist_ok=True)
 
     run_statistics = {
         'total_runs': runs,
@@ -654,7 +631,8 @@ def run_single_test(dashboard, run_logger, run_idx, steps, expected_map, logs_di
                     dashboard, run_logger, step_name,
                     exception="am crash detected",
                     run_idx=run_idx,
-                    video_started=video_started
+                    video_started=video_started,
+                    logs_dir= logs_dir
                 )
                 step_crashed = True
                 if should_break:
@@ -663,7 +641,7 @@ def run_single_test(dashboard, run_logger, run_idx, steps, expected_map, logs_di
         except Exception as ex:
             # Regular step crash path
             crash_type, crashed_step, video_stopped, _, should_break = handle_step_crash(
-                dashboard, run_logger, step_name, ex, run_idx, video_started
+                dashboard, run_logger, step_name, ex, run_idx, video_started, logs_dir
             )
             step_crashed = True
             if should_break:
@@ -679,7 +657,7 @@ def run_single_test(dashboard, run_logger, run_idx, steps, expected_map, logs_di
     # Status check
     status, status_error_type, status_error_message = {}, None, None
     if not step_crashed:
-        status, status_error_type, status_error_message = handle_get_status(dashboard, run_logger, run_idx)
+        status, status_error_type, status_error_message = handle_get_status(dashboard, run_logger, run_idx, logs_dir)
         if status_error_type:
             log_and_print(run_logger, f"get_status failed: {status_error_message}", "warning")
 
@@ -708,7 +686,7 @@ def run_single_test(dashboard, run_logger, run_idx, steps, expected_map, logs_di
     log_and_print(run_logger, f"Run {run_idx} execution time: {run_duration:.2f} seconds")
 
     # Cleanup video
-    cleanup_video_at_run_end(video_started, video_stopped, run_logger, result_type, run_idx)
+    cleanup_video_at_run_end(video_started, video_stopped, run_logger, result_type, run_idx, logs_dir)
     log_and_print(run_logger, f"=== Run {run_idx} END ===\n")
 
     return {
@@ -730,4 +708,4 @@ if __name__ == '__main__':
     app = AppHandler(arguments.desired_caps, command_executor='http://127.0.0.1:4723')
     dashboard = Dashboard(app)
     dashboard.start_benchmark_app()
-    test_dashboard(dashboard)
+    test_suite(dashboard)

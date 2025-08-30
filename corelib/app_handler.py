@@ -1,5 +1,4 @@
 try:
-    import os
     import re
     from appium import webdriver
     from appium.webdriver.appium_service import AppiumService
@@ -9,10 +8,8 @@ try:
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.common.exceptions import NoSuchElementException, TimeoutException, NoSuchWindowException
     from appium.options.android import UiAutomator2Options
-    from selenium.webdriver.common.action_chains import ActionChains
     from selenium.webdriver.common.actions.pointer_input import PointerInput
     from selenium.webdriver.common.actions.action_builder import ActionBuilder
-
     from corelib import utils
     from corelib.log_config import get_logger
     import logging
@@ -28,15 +25,11 @@ except ImportError as imp_err:
     raise
 
 BY_MAP = {
-    # Android
     'id': AppiumBy.ID,
     'xpath': AppiumBy.XPATH,
     'name': AppiumBy.NAME,
     'class_name': AppiumBy.CLASS_NAME,
     'uiautomator': AppiumBy.ANDROID_UIAUTOMATOR,
-    # iOS
-    'predicate': AppiumBy.IOS_PREDICATE,
-    'class_chain': AppiumBy.IOS_CLASS_CHAIN,
 }
 
 
@@ -56,7 +49,6 @@ class AppHandler:
         else:  # str -> config file
             self.desired_caps = utils.read_config_file(desired_caps)
         self.implicit_timeout = implicit_timeout
-        self.device_os = self.desired_caps.get('platformName').lower()
         self.driver = None
 
     def start_app(self):
@@ -124,8 +116,8 @@ class AppHandler:
             self.driver = None
             self.logger.debug("Unexpected error in quit_all, cleaned up driver reference", exc_info=True)
     
-    def get_device_node(self):
-        return self
+    # def get_device_node(self):
+    #     return self
 
     @property
     def session(self):
