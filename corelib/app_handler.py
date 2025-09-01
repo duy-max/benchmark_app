@@ -11,8 +11,7 @@ try:
     from selenium.webdriver.common.actions.pointer_input import PointerInput
     from selenium.webdriver.common.actions.action_builder import ActionBuilder
     from corelib import utils
-    from corelib.log_config import get_logger
-    import logging
+    from corelib.logger import Logger
     from pathlib import Path
     import subprocess
     from datetime import datetime
@@ -34,20 +33,16 @@ BY_MAP = {
 
 
 class AppHandler:
-    # locator format <attr>:<value> with <attr> is a By object, for example id:sign-in, name:logout
     DEFAULT_IMPLICIT_TIMEOUT = 8
     DEFAULT_EXPLICIT_TIMEOUT = 8
 
     def __init__(self, desired_caps, command_executor='http://127.0.0.1:4723',
                  implicit_timeout=DEFAULT_IMPLICIT_TIMEOUT):
-        self.logger = get_logger(name="benchmark_app", level=logging.DEBUG, filename="apphandler.log", dir_name="logs")
+        self.logger = Logger(name="benchmark_app", filename="apphandler.log", dir_name="logs")
         # Get the _log_path attribute from logger, or None if it doesn't exist
-        self._local_log_path = getattr(self.logger, "_log_path", None)
+        self._local_log_path = getattr(self.logger, "log_path", None)
         self.command_executor = command_executor
-        if isinstance(desired_caps, dict):
-            self.desired_caps = desired_caps
-        else:  # str -> config file
-            self.desired_caps = utils.read_config_file(desired_caps)
+        self.desired_caps = utils.read_config_file(desired_caps)
         self.implicit_timeout = implicit_timeout
         self.driver = None
 
@@ -63,7 +58,7 @@ class AppHandler:
                     self.logger.info("Existing driver detected - quitting before start.")
                     self.driver.quit()
                 except Exception:
-                    self.logger.debug("Ignoring error while quitting existing driver before start.", exc_info=True)
+                    self.logger.info("Ignoring error while quitting existing driver before start.")
                 finally:
                     self.driver = None
 
@@ -100,21 +95,21 @@ class AppHandler:
                             self.logger.info(f'Terminating app: {app_id}')
                             self.driver.terminate_app(app_id)
                         except Exception:
-                            self.logger.debug(f"Failed to terminate {app_id}", exc_info=True)
+                            self.logger.info(f"Failed to terminate {app_id}")
                 # quit driver session
                 try:
                     self.logger.info('Quitting driver session')
                     self.driver.quit()
                 except Exception:
-                    self.logger.debug("Error while quitting driver", exc_info=True)
+                    self.logger.info("Error while quitting driver")
                 finally:
                     self.driver = None
             else:
-                self.logger.debug("quit_all called but no active driver/session")
+                self.logger.info("quit_all called but no active driver/session")
         except Exception:
             # swallow to avoid raising during cleanup
             self.driver = None
-            self.logger.debug("Unexpected error in quit_all, cleaned up driver reference", exc_info=True)
+            self.logger.info("Unexpected error in quit_all, cleaned up driver reference")
     
     # def get_device_node(self):
     #     return self
@@ -123,62 +118,26 @@ class AppHandler:
     def session(self):
         return self.driver.session
 
-    def _ensure_logs_dir(self):
-        # create a logs folder under project root if not exists
-        project_root = Path(__file__).resolve().parents[1]  # corelib parent -> project root
-        logs_dir = project_root / "logs"
-        logs_dir.mkdir(parents=True, exist_ok=True)
-        self._logs_dir = str(logs_dir)
-
-    def dump_device_logs(self, output_dir=None, tag: str = None):
+    def dump_device_logs(self, output_dir, tag: str = None):
         """
         Collect device logs via adb: logcat (-d) and dmesg.
         If tag provided it will be appended to filenames (sanitized).
         Returns dict with file paths.
         """
-        if output_dir is None:
-            try:
-                self._ensure_logs_dir()
-                output_dir = self._logs_dir
-            except Exception:
-                project_root = Path(__file__).resolve().parents[1]
-                logs_dir = project_root / "logs"
-                logs_dir.mkdir(parents=True, exist_ok=True)
-                output_dir = str(logs_dir)
-
         ts = datetime.now().strftime('%Y%m%d_%H%M%S')
         out = {}
 
         # sanitize tag to safe suffix (only alnum and underscore)
         suffix = ""
         if tag:
-            import re
             safe = re.sub(r'[^0-9A-Za-z_]+', '_', tag)
             suffix = f"_{safe}"
 
-        # determine device id if provided by desired caps or driver capabilities
-        device_id = None
-        try:
-            device_id = self.desired_caps.get('udid') or self.desired_caps.get('deviceName')
-        except Exception:
-            device_id = None
-        try:
-            if self.driver and hasattr(self.driver, 'capabilities'):
-                device_id = device_id or self.driver.capabilities.get('udid') or self.driver.capabilities.get('deviceName')
-        except Exception:
-            pass
-        
+        device_id = self.get_device_id()
+
         def _run_and_write(cmd, filepath):
-            try:
-                self.logger.info(f"Running: {' '.join(cmd)}")
-                proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors='replace', timeout=30)
-                content = proc.stdout or proc.stderr or ''
-            except subprocess.TimeoutExpired:
-                content = "Command timed out"
-            except FileNotFoundError:
-                content = f"adb not found. Ensure Android platform-tools installed and adb is on PATH."
-            except Exception as ex:
-                content = f"Error running command: {ex}"
+            rc, out, err = self.run_adb(cmd)
+            content = out if rc == 0 else err
             try:
                 with open(filepath, "w", encoding="utf-8", errors="replace") as f:
                     f.write(content)
@@ -186,25 +145,14 @@ class AppHandler:
             except Exception as ex:
                 self.logger.error(f"Failed to write {filepath}: {ex}")
         # logcat
-        logcat_file = Path(output_dir) / f"logcat_{device_id or 'device'}{suffix}_{ts}.txt"
-        cmd = ["adb"]
-        # run the command on that specific device
-        if device_id:
-            cmd += ["-s", str(device_id)]
-        cmd += ["logcat", "-d"]
-        _run_and_write(cmd, logcat_file)
+        logcat_file = output_dir / f"logcat_{device_id}{suffix}_{ts}.txt"
+        _run_and_write(cmd =["logcat", "-d"], filepath = logcat_file)
         out['logcat'] = logcat_file
 
         # dmesg
-        dmesg_file = Path(output_dir) / f"dmesg_{device_id or 'device'}{suffix}_{ts}.txt"
-        cmd2 = ["adb"]
-        if device_id:
-            cmd2 += ["-s", str(device_id)]
-        cmd2 += ["shell", "dmesg"]
-        _run_and_write(cmd2, dmesg_file)
+        dmesg_file = output_dir / f"dmesg_{device_id}{suffix}_{ts}.txt"
+        _run_and_write(cmd = ["shell", "dmesg"], filepath = dmesg_file)
         out['dmesg'] = dmesg_file
-
-
         return out
 
     def collect_on_failure(self, reason=None, output_dir=None, tag: str = None):
@@ -485,7 +433,7 @@ class AppHandler:
             self.logger.info("Performed random multi-touch via execute('actions')")
 
         except Exception as e1:
-            self.logger.debug(f"Random multi-touch failed: {e1}")
+            self.logger.info(f"Random multi-touch failed: {e1}")
             self.logger.info("Fallback to fixed multi-touch")
             # Dùng lại element đã tìm thấy, không wait lại
             self.multi_touch_five_fingers(locator, element=element)
@@ -577,7 +525,7 @@ class AppHandler:
         Build base adb command with device selector if udid/deviceName is provided.
         """
         try:
-            device_id = self.desired_caps.get('udid') or self.desired_caps.get('deviceName')
+            device_id = self.get_device_id()
         except Exception:
             device_id = None
         cmd = ["adb"]
@@ -585,7 +533,7 @@ class AppHandler:
             cmd += ["-s", str(device_id)]
         return cmd
 
-    def _run_adb(self, extra_args, timeout=6):
+    def run_adb(self, extra_args, timeout=6):
         """
         Run adb with extra args; return (returncode, stdout, stderr).
         """
@@ -595,7 +543,7 @@ class AppHandler:
             p = subprocess.run(full, capture_output=True, text=True, timeout=timeout)
             return p.returncode, (p.stdout or ""), (p.stderr or "")
         except Exception as ex:
-            self.logger.debug(f"ADB call failed: {ex}", exc_info=True)
+            self.logger.info(f"ADB call failed: {ex}")
             return 1, "", str(ex)
 
     def disable_wifi_bluetooth(self, wait_sec=1.0):
@@ -619,13 +567,13 @@ class AppHandler:
         for category, cmd_list in cmds.items():
             success = False
             for cmd in cmd_list:
-                rc, out, err = self._run_adb(cmd)  # lấy tuple
+                rc, out, err = self.run_adb(cmd)  # lấy tuple
                 if rc == 0:
                     self.logger.info(f"{category}: success with `{cmd}` (stdout={out.strip()})")
                     success = True
                     break
                 else:
-                    self.logger.debug(f"{category}: failed `{cmd}` -> {err.strip()}")
+                    self.logger.info(f"{category}: failed `{cmd}` -> {err.strip()}")
             if not success:
                 self.logger.warning(f"{category}: all disable attempts failed")
 
@@ -635,42 +583,155 @@ class AppHandler:
             self.logger.warning(f"Failed to disable Wi‑Fi/Bluetooth: {ex}")
 
 
-    def check_device_status(self):
-        result = {}
+    # def check_device_status(self):
+    #     result = {}
+    #
+    #     # Battery
+    #     rc, out, _ = self.run_adb(["shell", "dumpsys", "battery"])
+    #     charging = False
+    #     if "USB powered: true" in out or "AC powered: true" in out or "Wireless powered: true" in out:
+    #         charging = True
+    #     if "status: 2" in out or "status: 5" in out:  # charging or full
+    #         charging = True
+    #     result["charging"] = charging
+    #
+    #     # SD Card
+    #     rc, out, _ = self.run_adb(["shell", "sm", "list-volumes", "all"])
+    #     sdcard = any(line.startswith("public:") and "mounted" in line for line in out.splitlines())
+    #     result["sdcard"] = sdcard
+    #
+    #     # Headset
+    #     rc, out, _ = self.run_adb(["shell", "dumpsys", "audio"])
+    #     headset = ("headset" in out.lower() or "headphone" in out.lower())
+    #     result["headset"] = headset
+    #
+    #     return result
 
-        # Battery
-        rc, out, _ = self._run_adb(["shell", "dumpsys", "battery"])
+    def is_battery_charging(self):
+        rc, out, _ = self.run_adb(["shell", "dumpsys", "battery"])
         charging = False
         if "USB powered: true" in out or "AC powered: true" in out or "Wireless powered: true" in out:
             charging = True
         if "status: 2" in out or "status: 5" in out:  # charging or full
             charging = True
-        result["charging"] = charging
+        return charging
 
-        # SD Card
-        rc, out, _ = self._run_adb(["shell", "sm", "list-volumes", "all"])
-        sdcard = any(line.startswith("public:") and "mounted" in line for line in out.splitlines())
-        result["sdcard"] = sdcard
 
-        # Headset
-        rc, out, _ = self._run_adb(["shell", "dumpsys", "audio"])
+    def is_headset_plugged(self):
+        rc, out, _ = self.run_adb(["shell", "dumpsys", "audio"])
         headset = ("headset" in out.lower() or "headphone" in out.lower())
-        result["headset"] = headset
+        return headset
 
-        return result
+    def is_sdcard_mounted(self):
+        rc, out, _ = self.run_adb(["shell", "sm", "list-volumes", "all"])
+        sdcard = any(line.startswith("public:") and "mounted" in line for line in out.splitlines())
+        return sdcard
 
-    def check_wifi_bluetooth(self):
-        result = {}
-
-        # Wi-Fi
-        rc, out, _ = self._run_adb(["shell", "settings", "get", "global", "wifi_on"])
+    def is_wifi_enabled(self):
+        # This only checks if Wi-Fi is enabled (switch on/off), it does NOT check if the device is connected to a network.
+        # To check if Wi-Fi is connected, use it: adb shell dumpsys wifi | grep "mNetworkInfo"
+        rc, out, _ = self.run_adb(["shell", "settings", "get", "global", "wifi_on"])
         wifi = (out.strip() == "1")
-        result["wifi"] = wifi
+        return wifi
 
-        # Bluetooth
-        rc, out, _ = self._run_adb(["shell", "settings", "get", "global", "bluetooth_on"])
+    def is_bluetooth_enabled(self):
+        rc, out, _ = self.run_adb(["shell", "settings", "get", "global", "bluetooth_on"])
         bluetooth = (out.strip() == "1")
-        result["bluetooth"] = bluetooth
+        return bluetooth
 
-        return result
+    def get_device_id(self):
+        return self.desired_caps.get('udid')
 
+    # python
+    def check_flashlight(self):
+        """
+        Check flashlight/torch state via adb. Returns True if appears ON, False otherwise.
+        """
+        try:
+            probes = [
+                ["shell", "dumpsys", "flashlight"],
+                ["shell", "dumpsys", "media.camera"],
+                ["shell", "dumpsys", "camera"],
+                ["shell", "dumpsys", "device_policy"]  # fallback; harmless if unsupported
+            ]
+            for cmd in probes:
+                rc, out, err = self.run_adb(cmd)
+                text = (out or "") + (err or "")
+                low = text.lower()
+                # match a few common indicators
+                if "torchmode=on" in low or "torch mode" in low or "torch: on" in low:
+                    return True
+                if "flashlight" in low and ("on" in low or "enabled" in low):
+                    return True
+                if "enabled=true" in low or "on=true" in low or "state: on" in low:
+                    return True
+            return False
+        except Exception:
+            return False
+
+    def is_brightness_increasing(self, delay: float = 2.0) -> bool:
+        """
+        Check if screen brightness is increasing over a short interval.
+        Run adb twice with a delay, compare values.
+        Returns True if brightness difference > 0, else False.
+        """
+
+        def _get_level():
+            rc, out, _ = self.run_adb(["shell", "settings", "get", "system", "screen_brightness"])
+            if rc == 0 and (out or "").strip().isdigit():
+                return int(out.strip())
+            return None
+
+        first = _get_level()
+        if first is None:
+            return False
+
+        time.sleep(delay)  # wait a bit before re-checking
+
+        second = _get_level()
+        if second is None:
+            return False
+
+        return (second - first) > 0
+
+    def check_brightness(self):
+        """
+        Check screen brightness via adb settings. Returns True if brightness value > 0, False otherwise.
+        """
+        try:
+            rc, out, err = self.run_adb(["shell", "settings", "get", "system", "screen_brightness"])
+            if rc != 0:
+                return False
+            val = (out or "").strip()
+            if not val:
+                return False
+            # sometimes adb returns non-numeric; guard it
+            try:
+                iv = int(val)
+                return iv > 0
+            except ValueError:
+                # fallback: try reading backlight sysfs (best-effort)
+                try:
+                    rc2, out2, err2 = self.run_adb(["shell", "cat", "/sys/class/backlight/*/brightness"])
+                    if rc2 == 0 and out2.strip().isdigit():
+                        return int(out2.strip()) > 0
+                except Exception:
+                    pass
+                return False
+        except Exception:
+            return False
+
+    # def check_wifi_bluetooth(self):
+    #     result = {}
+    #
+    #     # Wi-Fi
+    #     rc, out, _ = self.run_adb(["shell", "settings", "get", "global", "wifi_on"])
+    #     wifi = (out.strip() == "1")
+    #     result["wifi"] = wifi
+    #
+    #     # Bluetooth
+    #     rc, out, _ = self.run_adb(["shell", "settings", "get", "global", "bluetooth_on"])
+    #     bluetooth = (out.strip() == "1")
+    #     result["bluetooth"] = bluetooth
+    #
+    #     return result

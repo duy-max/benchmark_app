@@ -3,7 +3,6 @@ try:
     import yaml
     import platform
     import json
-
     from yaml.scanner import ScannerError
     from json.decoder import JSONDecodeError
 

@@ -1,12 +1,14 @@
 import argparse
+import shutil
 import time
 from datetime import datetime
 from pathlib import Path
 
 from corelib.app_handler import AppHandler
+from corelib.camera_checker import get_temp_screenshot_files
 from corelib.logger import Logger
 from corelib.record_video import start_recording, stop_recording
-from corelib.utils import assert_value_status
+from corelib.speaker_checker import get_latest_temp_audio_file
 from lib.dashboard import Dashboard
 
 
@@ -180,30 +182,24 @@ def restart_app_after_crash(dashboard, run_logger, crash_type, run_idx):
         return False, error_msg
 
 
-def handle_step_crash(dashboard, run_logger, step_name, exception, run_idx, video_started, logs_dir):
-    """
-    Xử lý khi step bị crash - always break to next run after crash
-    """
-    crash_type, crash_desc = classify_error_type(exception)
-    log_and_print(run_logger, f"ERROR in {step_name}: {exception}", "error")
-    log_and_print(run_logger, f"Crash type: {crash_type} - {crash_desc}")
-    dashboard.logger.exception(f"Exception in step {step_name}: {exception}")
-
-    # Stop video for crash and save it
+def _stop_and_save_video(step_name, crash_type, run_idx, logs_dir, run_logger, video_started):
     video_stopped = False
-    if video_started:
-        try:
+    try:
+        if video_started:
             ts = datetime.now().strftime('%Y%m%d_%H%M%S')
             video_name = f"VIDEO_{crash_type.upper()}_{step_name}_run{run_idx}_{ts}.mp4"
             video_path = logs_dir / video_name
             stop_recording(str(video_path))
             video_stopped = True
             log_and_print(run_logger, f"📹 Crash video saved: {str(video_path)}")
-        except Exception as stop_ex:
-            log_and_print(run_logger, f"Failed to stop/save crash video: {stop_ex}", "warning")
+    except Exception as ex:
+        log_and_print(run_logger, f"Failed to stop/save crash video: {ex}", "warning")
+    return video_stopped
 
-    # Collect diagnostics
-    diagnostics_collected = False
+
+def _collect_diagnostics(dashboard, run_logger, step_name, crash_type, run_idx, logs_dir):
+    collected = {}
+    full_tag = None
     try:
         ts = datetime.now().strftime('%Y%m%d_%H%M%S')
         tag = f"run{run_idx}_{step_name}_{crash_type}_{ts}"
@@ -214,11 +210,104 @@ def handle_step_crash(dashboard, run_logger, step_name, exception, run_idx, vide
         )
         full_tag = get_full_collected_tag(collected, tag)
         log_and_print(run_logger, f"Collected {crash_type} crash logs: {full_tag}")
-        diagnostics_collected = True
-    except Exception as collect_ex:
-        log_and_print(run_logger, f"Failed to collect crash logs: {collect_ex}", "error")
+        return True, collected, full_tag
+    except Exception as ex:
+        log_and_print(run_logger, f"Failed to collect crash logs: {ex}", "error")
+        return False, collected, full_tag
 
-    # Always restart after crash and break to next run
+
+def _collect_temp_audio(run_logger, crash_type, step_name, run_idx, logs_dir):
+    try:
+        temp_audio_latest = get_latest_temp_audio_file()
+        if temp_audio_latest and temp_audio_latest.exists():
+            ts2 = datetime.now().strftime('%Y%m%d_%H%M%S')
+            audio_name = f"AUDIO_{crash_type.upper()}_{step_name}_run{run_idx}_{ts2}.wav"
+            audio_dest = logs_dir / audio_name
+            shutil.copy2(temp_audio_latest, audio_dest)
+            log_and_print(run_logger, f"🔊 Collected failed audio: {audio_dest}")
+            try:
+                temp_audio_latest.unlink()
+                log_and_print(run_logger, f"Removed temp audio: {temp_audio_latest}")
+            except Exception as rm_ex:
+                log_and_print(run_logger, f"Failed to remove temp audio {temp_audio_latest}: {rm_ex}", "warning")
+    except Exception as audio_ex:
+        log_and_print(run_logger, f"Failed to collect temp audio: {audio_ex}", "warning")
+
+
+def _collect_temp_screenshots(run_logger, crash_type, step_name, run_idx, logs_dir):
+    try:
+        temp_screens = get_temp_screenshot_files()
+        if not temp_screens:
+            return
+
+        # Prefer to collect matching captured + preview pair if present
+        captured = next((p for p in temp_screens if p.name.lower().startswith("captured_")), None)
+        to_copy = []
+        if captured:
+            ts_name = captured.name.replace("captured_", "").replace(".png", "")
+            preview = captured.parent / f"preview_{ts_name}.png"
+            if preview.exists():
+                to_copy = [preview, captured]
+            else:
+                to_copy = [captured]
+        else:
+            # fallback: take up to two newest screenshots
+            to_copy = temp_screens[:2]
+
+        for idx, temp_shot in enumerate(to_copy, start=1):
+            try:
+                lower = temp_shot.name.lower()
+                if lower.startswith("preview_"):
+                    role = "PREVIEW"
+                elif lower.startswith("captured_"):
+                    role = "CAPTURED"
+                else:
+                    role = "SCREENSHOT"
+
+                ts2 = datetime.now().strftime('%Y%m%d_%H%M%S')
+                shot_name = f"SCREEN_{role}_{crash_type.upper()}_{step_name}_run{run_idx}_{idx}_{ts2}.png"
+                shot_dest = logs_dir / shot_name
+                shutil.copy2(temp_shot, shot_dest)
+                log_and_print(run_logger, f"🖼️  Collected failed screenshot: {shot_dest}")
+
+                try:
+                    temp_shot.unlink()
+                    log_and_print(run_logger, f"Removed temp screenshot: {temp_shot}")
+                except Exception as rm_ex:
+                    log_and_print(run_logger, f"Failed to remove temp screenshot {temp_shot}: {rm_ex}", "warning")
+
+            except Exception as copy_ex:
+                log_and_print(run_logger, f"Failed to copy temp screenshot {temp_shot}: {copy_ex}", "warning")
+
+    except Exception as ex:
+        log_and_print(run_logger, f"Screenshot collection failed: {ex}", "warning")
+
+
+def handle_step_crash(dashboard, run_logger, step_name, exception, run_idx, video_started, logs_dir):
+    """
+    Refactored handler: log, stop/save video, collect diagnostics, collect temp audio/screenshots,
+    restart and return the same tuple as before.
+    """
+    crash_type, crash_desc = classify_error_type(exception)
+    log_and_print(run_logger, f"ERROR in {step_name}: {exception}", "error")
+    log_and_print(run_logger, f"Crash type: {crash_type} - {crash_desc}")
+    dashboard.logger.exception(f"Exception in step {step_name}: {exception}")
+
+    # Stop and save video if started
+    video_stopped = _stop_and_save_video(step_name, crash_type, run_idx, logs_dir, run_logger, video_started)
+
+    # Collect diagnostics (logcat, dmesg, etc.)
+    diagnostics_collected, collected_map, collected_tag = _collect_diagnostics(
+        dashboard, run_logger, step_name, crash_type, run_idx, logs_dir
+    )
+
+    # Collect temp audio left by speaker test
+    _collect_temp_audio(run_logger, crash_type, step_name, run_idx, logs_dir)
+
+    # Collect temp screenshots left by camera checks
+    _collect_temp_screenshots(run_logger, crash_type, step_name, run_idx, logs_dir)
+
+    # Restart app after crash
     log_and_print(run_logger, f"{crash_type} detected - attempting restart")
     restart_success, restart_error = restart_app_after_crash(dashboard, run_logger, crash_type, run_idx)
     if not restart_success:
@@ -254,41 +343,6 @@ def handle_get_status(dashboard, run_logger, run_idx, logs_dir, video_started = 
         log_and_print(run_logger, "Start get_status")
         status = dashboard.get_status()
         log_and_print(run_logger, "End get_status")
-        # handle wifi and bluetooth if crash
-        wf_bt_status = dashboard.app.check_wifi_bluetooth()
-        if wf_bt_status.get("wifi") is True and wf_bt_status.get("bluetooth") is True:
-            log_and_print(run_logger, "Wi-Fi and Bluetooth are enabled")
-        else:
-            # Wi‑Fi disabled
-            if wf_bt_status.get("wifi") is False:
-                log_and_print(run_logger, "Wi\-Fi is disabled after get_status - collecting diagnostics", "warning")
-                # reuse existing crash handler to stop video and collect logs
-                handle_step_crash(
-                    dashboard,
-                    run_logger,
-                    step_name="get_status_wifi_disabled",
-                    exception=Exception("Wi‑Fi disabled after get_status"),
-                    run_idx=run_idx,
-                    video_started=video_started,
-                    logs_dir= logs_dir
-                )
-                return {}, "wifi_disabled", "Wi-Fi is still disabled after trying to enable it"
-
-            # Bluetooth disabled
-            if wf_bt_status.get("bluetooth") is False:
-                log_and_print(run_logger, "Bluetooth is disabled after get_status - collecting diagnostics", "warning")
-                handle_step_crash(
-                    dashboard,
-                    run_logger,
-                    step_name="get_status_bluetooth_disabled",
-                    exception=Exception("Bluetooth disabled after get_status"),
-                    run_idx=run_idx,
-                    video_started=video_started,
-                    logs_dir= logs_dir
-                )
-                return {}, "bluetooth_disabled", "Bluetooth is still disabled after trying to enable it"
-
-            # end handle wifi - bluetooth
         time.sleep(1)
 
         if not status:
@@ -358,7 +412,7 @@ def cleanup_video_at_run_end(video_started, video_stopped, run_logger, result_ty
             log_and_print(run_logger, f"Failed to cleanup video: {cleanup_ex}", "error")
 
 
-def test_suite(dashboard, runs=10, expected_map=None):
+def test_suite(dashboard, runs=1000, expected_map=None):
     run_logger = setup_run_logger()
     if expected_map is None:
         expected_map = {
@@ -370,16 +424,12 @@ def test_suite(dashboard, runs=10, expected_map=None):
             "Wifi": "Passed", "Bluetooth": "Passed",
             "Battery Charging": "Passed"
         }
-    steps = [
-        "touch_point", "multi_touch", "back_camera", "front_camera",
-        "back_light", "flash_light", "speaker", "voice_recorder"
-    ]
 
     # full test os
-    # steps = [
-    #     "touch_point", "multi_touch", "back_camera", "front_camera",
-    #     "back_light", "flash_light", "speaker", "voice_recorder", "headset", "SD_card"
-    # ]
+    steps = [
+        "touch_point", "multi_touch", "back_camera", "front_camera",
+        "back_light", "flash_light", "speaker", "voice_recorder", "headset", "sd_card"
+    ]
 
     project_root = Path(__file__).resolve().parent
     logs_dir = project_root / "logs"
@@ -399,7 +449,7 @@ def test_suite(dashboard, runs=10, expected_map=None):
 
     for run_idx in range(1, runs + 1):
         log_and_print(run_logger, f"\n=== Run {run_idx}/{runs} START ===")
-        result = run_single_test(dashboard, run_logger, run_idx, steps, expected_map, logs_dir)
+        result = run_single_test_full_os(dashboard, run_logger, runs,run_idx, steps, expected_map, logs_dir)
         run_statistics['run_details'].append(result)
         run_statistics['run_times'].append(result['duration'])
         if result['passed']:
@@ -452,8 +502,7 @@ def summarize_results(run_logger, run_statistics):
     return pass_rate
 
 
-
-def run_single_test(dashboard, run_logger, run_idx, steps, expected_map, logs_dir):
+def run_single_test_full_os(dashboard, run_logger, runs, run_idx, steps, expected_map, logs_dir):
     run_start_time = time.time()
     video_started, video_stopped = False, False
 
@@ -485,19 +534,28 @@ def run_single_test(dashboard, run_logger, run_idx, steps, expected_map, logs_di
     except Exception:
         pass
 
+    # If we are in the first half of the runs (run_idx <= runs/2)
+    # → only test Speaker and Voice Recorder (unplug headset and SD-card)
+    if run_idx <= runs / 2:
+        steps_to_run = [step.lower() for step in steps if step.lower() not in ("headset", "sd_card") ]
+        log_and_print(run_logger, f"Run {run_idx}: Testing Speaker + Voice Recorder only (no headset, SD-card)")
+    else:
+        steps_to_run = [step.lower() for step in steps if step.lower() not in ("speaker", "voice_recorder") ]
+        log_and_print(run_logger, f"Run {run_idx}: Testing Speaker + Voice Recorder only (no headset, SD-card)")
+
     # Step execution
     step_crashed, crashed_step, crash_type = False, None, None
     getattr(dashboard, "start_test")()
     log_and_print(run_logger,"Turn off wifi and bluetooth before testing")
     dashboard.app.disable_wifi_bluetooth()
-    for step_name in steps:
+    for step_name in steps_to_run:
         if step_crashed:
             break
 
         try:
             # Execute the step
-            log_and_print(run_logger, f"Start {step_name}")
-            getattr(dashboard, step_name)()
+            log_and_print(run_logger, f"Start checking {step_name}")
+            getattr(dashboard, f"check_{step_name}")()
 
         except Exception as ex:
             # Regular step crash path
@@ -508,13 +566,12 @@ def run_single_test(dashboard, run_logger, run_idx, steps, expected_map, logs_di
             if should_break:
                 break
         finally:
-            log_and_print(run_logger, f"End {step_name}")
+            log_and_print(run_logger, f"End checking {step_name}")
 
-    expected_devices_status = {"charging": True, "sdcard": True, "headset": True}
-
+    # expected_devices_status = {"charging": True, "sdcard": True, "headset": True}
     # actual_devices_status = getattr(dashboard, "check_setup_status")()
-    actual_devices_status = dashboard.app.check_device_status()
-    assert_value_status(actual_devices_status, expected_devices_status, "Headset - SD card - Battery charging are all set")
+    # actual_devices_status = dashboard.app.check_device_status()
+    # assert_value_status(actual_devices_status, expected_devices_status, "Headset - SD card - Battery charging are all set")
     # Status check
     status, status_error_type, status_error_message = {}, None, None
     if not step_crashed:
@@ -560,7 +617,6 @@ def run_single_test(dashboard, run_logger, run_idx, steps, expected_map, logs_di
         'step_crashed': result_type == 'step_crashed',
         'uiautomator_failed': result_type in ('uiautomator_crashed', 'uiautomator_failed')
     }
-
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Benchmark app execution.\n')

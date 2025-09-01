@@ -4,6 +4,8 @@ TOUCH_POINTS = 'xpath:(//android.view.View[@resource-id="com.innova.benchmark:id
 
 MULTI_TOUCH = 'id:com.innova.benchmark:id/multi_touch_view'
 
+YES_NO_DIALOG = ''
+
 SNAPSHOT_BTN = 'id:com.innova.benchmark:id/btnSnapshot'
 
 SNAPSHOT_CONFIRM_YES = 'xpath://android.widget.Button[@resource-id="com.innova.benchmark:id/btnYes"]'
@@ -19,3 +21,11 @@ FUNC_STATUS = 'xpath:(//android.widget.TextView[@resource-id="com.innova.benchma
 TEST_REPORT_SAVE = 'xpath://android.widget.Toast[@text="Test Report saved"]'
 
 BACK_BTN = 'id:com.innova.benchmark:id/button_back'
+
+HEADSET_DIALOG = ''
+
+SD_CARD_DIALOG = ''
+
+WIFI_DIALOG = ''
+
+BLUETOOTH_DIALOG = ''
